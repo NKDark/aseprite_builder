@@ -162,24 +162,55 @@ jobs:
       # Ask the checked-out Aseprite/LAF version which Skia package
       # it expects.
       # ------------------------------------------------------------
+      - name: Inspect Skia helper
+        working-directory: aseprite
+        shell: bash
+        run: |
+          echo "=== Aseprite ==="
+          git describe --tags --always
+
+          echo "=== skia-url.sh ==="
+          cat laf/misc/skia-url.sh
 
       - name: Get Skia URL
         id: skia
         working-directory: aseprite
         shell: bash
         run: |
-          set -euo pipefail
+          set -eo pipefail
 
-          if [[ "${{ runner.os }}" == "Windows" ]]; then
-            repo_dir="$(cygpath "$PWD")"
-          else
-            repo_dir="$PWD"
-          fi
+          case "${{ runner.os }}" in
+            Windows)
+              platform="Windows"
+              ;;
+            Linux)
+              platform="Linux"
+              ;;
+            macOS)
+              platform="macOS"
+              ;;
+            *)
+              echo "Unsupported platform: ${{ runner.os }}"
+              exit 1
+              ;;
+          esac
 
-          skia_url="$(source "$repo_dir/laf/misc/skia-url.sh" | xargs)"
+          echo "Platform: $platform"
+
+          skia_url="$(
+            bash laf/misc/skia-url.sh "$platform" "${{ matrix.skia_arch }}"
+          )"
+
+          skia_url="$(echo "$skia_url" | tail -n 1 | xargs)"
           skia_file="$(basename "$skia_url")"
 
+          if [[ -z "$skia_url" ]]; then
+            echo "Failed to determine Skia URL"
+            exit 1
+          fi
+
           echo "Skia URL: $skia_url"
+          echo "Skia file: $skia_file"
 
           echo "url=$skia_url" >> "$GITHUB_OUTPUT"
           echo "file=$skia_file" >> "$GITHUB_OUTPUT"
