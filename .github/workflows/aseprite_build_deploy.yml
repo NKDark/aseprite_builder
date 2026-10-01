@@ -2,8 +2,10 @@ name: Build and deploy Aseprite
 
 on:
   workflow_dispatch:
+
   schedule:
     - cron: "0 6 1 * *"
+
   push:
     branches:
       - master
@@ -16,6 +18,10 @@ env:
   BUILD_TYPE: Release
 
 jobs:
+  # ============================================================
+  # Check latest upstream Aseprite release
+  # ============================================================
+
   check-version:
     name: Check latest Aseprite release
     runs-on: ubuntu-latest
@@ -33,10 +39,16 @@ jobs:
         run: |
           set -euo pipefail
 
-          data="$(curl --fail --silent --show-error \
-            -H "Authorization: Bearer ${GH_TOKEN}" \
-            -H "Accept: application/vnd.github+json" \
-            https://api.github.com/repos/aseprite/aseprite/releases/latest)"
+          data="$(
+            curl \
+              --fail \
+              --silent \
+              --show-error \
+              --location \
+              -H "Authorization: Bearer ${GH_TOKEN}" \
+              -H "Accept: application/vnd.github+json" \
+              https://api.github.com/repos/aseprite/aseprite/releases/latest
+          )"
 
           latest_tag="$(jq -r '.tag_name' <<< "$data")"
 
@@ -48,7 +60,7 @@ jobs:
           echo "Latest Aseprite release: $latest_tag"
           echo "latest_tag=$latest_tag" >> "$GITHUB_OUTPUT"
 
-      - name: Check whether release already exists
+      - name: Check whether build is required
         id: check
         shell: bash
         env:
@@ -57,41 +69,64 @@ jobs:
         run: |
           set -euo pipefail
 
-          # Manual runs and pushes to "fix" always rebuild.
-          if [[ "${{ github.event_name }}" == "workflow_dispatch" ||
-                "${{ github.ref }}" == "refs/heads/fix" ]]; then
-            echo "Forced build."
+          # Manual runs always rebuild.
+          if [[ "${{ github.event_name }}" == "workflow_dispatch" ]]; then
+            echo "Manual build requested."
             echo "should_build=true" >> "$GITHUB_OUTPUT"
             exit 0
           fi
 
-          # Check whether this repository already has a release
-          # for the latest Aseprite version.
-          status="$(curl --silent --output /dev/null --write-out "%{http_code}" \
-            -H "Authorization: Bearer ${GH_TOKEN}" \
-            -H "Accept: application/vnd.github+json" \
-            "https://api.github.com/repos/${{ github.repository }}/releases/tags/${TAG}")"
-
-          if [[ "$status" == "200" ]]; then
-            echo "Release $TAG already exists."
-            echo "should_build=false" >> "$GITHUB_OUTPUT"
-          elif [[ "$status" == "404" ]]; then
-            echo "Release $TAG does not exist. Building."
+          # Pushes to the fix branch always rebuild.
+          if [[ "${{ github.ref }}" == "refs/heads/fix" ]]; then
+            echo "Fix branch build requested."
             echo "should_build=true" >> "$GITHUB_OUTPUT"
-          else
-            echo "GitHub API returned HTTP $status"
-            exit 1
+            exit 0
           fi
+
+          # Check whether our repository already has a release
+          # corresponding to this upstream Aseprite version.
+          status="$(
+            curl \
+              --silent \
+              --output /dev/null \
+              --write-out "%{http_code}" \
+              -H "Authorization: Bearer ${GH_TOKEN}" \
+              -H "Accept: application/vnd.github+json" \
+              "https://api.github.com/repos/${{ github.repository }}/releases/tags/${TAG}"
+          )"
+
+          case "$status" in
+            200)
+              echo "Release $TAG already exists."
+              echo "should_build=false" >> "$GITHUB_OUTPUT"
+              ;;
+            404)
+              echo "Release $TAG does not exist."
+              echo "should_build=true" >> "$GITHUB_OUTPUT"
+              ;;
+            *)
+              echo "GitHub API returned HTTP $status"
+              exit 1
+              ;;
+          esac
+
+  # ============================================================
+  # Build
+  # ============================================================
 
   build-aseprite:
     name: Build Aseprite (${{ matrix.name }})
-    needs: check-version
+
+    needs:
+      - check-version
+
     if: needs.check-version.outputs.should_build == 'true'
 
     runs-on: ${{ matrix.os }}
 
     strategy:
       fail-fast: false
+
       matrix:
         include:
           - os: windows-latest
@@ -107,9 +142,9 @@ jobs:
             skia_arch: arm64
 
     steps:
-      # ------------------------------------------------------------
-      # Download exact Aseprite release including submodules
-      # ------------------------------------------------------------
+      # ----------------------------------------------------------
+      # Checkout exact upstream release
+      # ----------------------------------------------------------
 
       - name: Checkout Aseprite
         uses: actions/checkout@v7
@@ -119,17 +154,19 @@ jobs:
           submodules: recursive
           path: aseprite
 
-      # ------------------------------------------------------------
+      # ----------------------------------------------------------
       # Dependencies
-      # ------------------------------------------------------------
+      # ----------------------------------------------------------
 
       - name: Install Linux dependencies
         if: runner.os == 'Linux'
         shell: bash
         run: |
+          set -euo pipefail
+
           sudo apt-get update -qq
+
           sudo apt-get install -y \
-            g++ \
             clang \
             cmake \
             ninja-build \
@@ -154,76 +191,49 @@ jobs:
         with:
           arch: x64
 
-      # ------------------------------------------------------------
-      # Skia
+      # ----------------------------------------------------------
+      # Determine required Skia
       #
-      # Important:
-      # Don't hard-code a Skia release here.
-      # Ask the checked-out Aseprite/LAF version which Skia package
-      # it expects.
-      # ------------------------------------------------------------
-      - name: Inspect Skia helper
-        working-directory: aseprite
-        shell: bash
-        run: |
-          echo "=== Aseprite ==="
-          git describe --tags --always
-
-          echo "=== skia-url.sh ==="
-          cat laf/misc/skia-url.sh
+      # IMPORTANT:
+      # skia-url.sh expects the build configuration as $1.
+      # For this workflow that is "Release".
+      # ----------------------------------------------------------
 
       - name: Get Skia URL
         id: skia
         working-directory: aseprite
         shell: bash
         run: |
-          set -eo pipefail
+          set -euo pipefail
 
-          case "${{ runner.os }}" in
-            Windows)
-              platform="Windows"
-              ;;
-            Linux)
-              platform="Linux"
-              ;;
-            macOS)
-              platform="macOS"
-              ;;
-            *)
-              echo "Unsupported platform: ${{ runner.os }}"
-              exit 1
-              ;;
-          esac
-
-          echo "Platform: $platform"
-
-          skia_url="$(
-            bash laf/misc/skia-url.sh "$platform" "${{ matrix.skia_arch }}"
-          )"
-
-          skia_url="$(echo "$skia_url" | tail -n 1 | xargs)"
+          skia_url="$(bash laf/misc/skia-url.sh Release | xargs)"
           skia_file="$(basename "$skia_url")"
 
           if [[ -z "$skia_url" ]]; then
-            echo "Failed to determine Skia URL"
+            echo "Failed to determine Skia URL."
             exit 1
           fi
 
-          echo "Skia URL: $skia_url"
+          echo "Skia URL:  $skia_url"
           echo "Skia file: $skia_file"
 
           echo "url=$skia_url" >> "$GITHUB_OUTPUT"
           echo "file=$skia_file" >> "$GITHUB_OUTPUT"
+
+      # ----------------------------------------------------------
+      # Skia cache
+      # ----------------------------------------------------------
 
       - name: Cache Skia
         id: skia-cache
         uses: actions/cache@v4
         with:
           path: skia
-          key: >-
-            skia-${{ runner.os }}-${{ matrix.skia_arch }}-${{
-              hashFiles('aseprite/laf/misc/skia-url.sh')
-            }}
+          key: skia-${{ runner.os }}-${{ matrix.skia_arch }}-${{ hashFiles('aseprite/laf/misc/skia-tag.txt') }}
+
+      # ----------------------------------------------------------
+      # Download Skia
+      # ----------------------------------------------------------
 
       - name: Download Skia
         if: steps.skia-cache.outputs.cache-hit != 'true'
@@ -234,21 +244,31 @@ jobs:
         run: |
           set -euo pipefail
 
+          echo "Downloading:"
+          echo "$SKIA_URL"
+
           curl \
             --fail \
             --show-error \
             --location \
             --retry 3 \
+            --retry-delay 2 \
             --ssl-revoke-best-effort \
             -o "$SKIA_FILE" \
             "$SKIA_URL"
 
           mkdir -p skia
-          unzip "$SKIA_FILE" -d skia
 
-      # ------------------------------------------------------------
-      # Configure
-      # ------------------------------------------------------------
+          unzip \
+            -q \
+            "$SKIA_FILE" \
+            -d skia
+
+          echo "Skia extracted."
+
+      # ----------------------------------------------------------
+      # Configure Aseprite
+      # ----------------------------------------------------------
 
       - name: Configure Aseprite
         working-directory: aseprite
@@ -256,30 +276,72 @@ jobs:
         run: |
           set -euo pipefail
 
-          cmake \
-            -S . \
-            -B build \
-            -G Ninja \
-            -DCMAKE_BUILD_TYPE=${{ env.BUILD_TYPE }} \
-            -DCMAKE_OSX_DEPLOYMENT_TARGET=11.0 \
-            -DLAF_BACKEND=skia \
-            -DSKIA_DIR="$(realpath ../skia)" \
-            -DSKIA_LIBRARY_DIR="$(realpath ../skia/out/Release-${{ matrix.skia_arch }})"
+          # Linux precompiled Skia requires clang + libstdc++.
+          if [[ "${{ runner.os }}" == "Linux" ]]; then
+            export CC=clang
+            export CXX=clang++
+          fi
 
-      # ------------------------------------------------------------
+          cmake_args=(
+            -S .
+            -B build
+            -G Ninja
+            -DCMAKE_BUILD_TYPE=${{ env.BUILD_TYPE }}
+            -DLAF_BACKEND=skia
+            -DSKIA_DIR="$(realpath ../skia)"
+            -DSKIA_LIBRARY_DIR="$(realpath ../skia/out/Release-${{ matrix.skia_arch }})"
+          )
+
+          if [[ "${{ runner.os }}" == "Linux" ]]; then
+            cmake_args+=(
+              "-DCMAKE_CXX_FLAGS:STRING=-stdlib=libstdc++"
+              "-DCMAKE_EXE_LINKER_FLAGS:STRING=-stdlib=libstdc++"
+            )
+          fi
+
+          if [[ "${{ runner.os }}" == "macOS" ]]; then
+            cmake_args+=(
+              "-DCMAKE_OSX_ARCHITECTURES=arm64"
+              "-DCMAKE_OSX_DEPLOYMENT_TARGET=11.0"
+              "-DPNG_ARM_NEON:STRING=on"
+            )
+          fi
+
+          cmake "${cmake_args[@]}"
+
+      # ----------------------------------------------------------
       # Build
-      # ------------------------------------------------------------
+      # ----------------------------------------------------------
 
       - name: Build Aseprite
         working-directory: aseprite
         shell: bash
         run: |
           set -euo pipefail
-          cmake --build build -- aseprite
 
-      # ------------------------------------------------------------
-      # Portable configuration
-      # ------------------------------------------------------------
+          cmake \
+            --build build \
+            --target aseprite
+
+      # ----------------------------------------------------------
+      # Remove build-only helper binaries
+      # ----------------------------------------------------------
+
+      - name: Clean build output
+        working-directory: aseprite/build/bin
+        shell: bash
+        run: |
+          rm -f \
+            gen \
+            gen.exe \
+            gen.exe.manifest \
+            modp_b64_gen \
+            modp_b64_gen.exe \
+            modp_b64_gen.exe.manifest
+
+      # ----------------------------------------------------------
+      # Portable mode
+      # ----------------------------------------------------------
 
       - name: Enable portable mode
         working-directory: aseprite/build/bin
@@ -288,11 +350,11 @@ jobs:
           echo "# This file is here so Aseprite behaves as a portable program" \
             > aseprite.ini
 
-      # ------------------------------------------------------------
+      # ----------------------------------------------------------
       # Package
-      # ------------------------------------------------------------
+      # ----------------------------------------------------------
 
-      - name: Create package
+      - name: Create ZIP package
         shell: pwsh
         env:
           TAG: ${{ needs.check-version.outputs.latest_tag }}
@@ -300,19 +362,26 @@ jobs:
         run: |
           $archive = "Aseprite-$env:TAG-$env:PLATFORM.zip"
 
+          if (Test-Path $archive) {
+            Remove-Item $archive -Force
+          }
+
           Compress-Archive `
             -Path "aseprite/build/bin/*" `
             -DestinationPath $archive `
             -CompressionLevel Optimal
 
-          "ASSET=$archive" | Out-File `
-            -FilePath $env:GITHUB_ENV `
-            -Encoding utf8 `
-            -Append
+          Write-Host "Created $archive"
 
-      # ------------------------------------------------------------
-      # Keep build artifact too
-      # ------------------------------------------------------------
+          "ASSET=$archive" |
+            Out-File `
+              -FilePath $env:GITHUB_ENV `
+              -Encoding utf8 `
+              -Append
+
+      # ----------------------------------------------------------
+      # Upload build artifact
+      # ----------------------------------------------------------
 
       - name: Upload workflow artifact
         uses: actions/upload-artifact@v4
@@ -320,16 +389,94 @@ jobs:
           name: Aseprite-${{ needs.check-version.outputs.latest_tag }}-${{ matrix.name }}
           path: ${{ env.ASSET }}
           if-no-files-found: error
+          retention-days: 7
 
-      # ------------------------------------------------------------
-      # GitHub Release
-      # ------------------------------------------------------------
+  # ============================================================
+  # Release
+  #
+  # IMPORTANT:
+  # Only ONE job touches GitHub Releases.
+  # This avoids three matrix jobs trying to modify the same
+  # release concurrently.
+  # ============================================================
 
-      - name: Upload to GitHub Release
+  release:
+    name: Create GitHub Release
+
+    needs:
+      - check-version
+      - build-aseprite
+
+    if: |
+      always() &&
+      needs.check-version.outputs.should_build == 'true' &&
+      needs.build-aseprite.result == 'success'
+
+    runs-on: ubuntu-latest
+
+    permissions:
+      contents: write
+
+    steps:
+      # ----------------------------------------------------------
+      # Download all three packages
+      # ----------------------------------------------------------
+
+      - name: Download build artifacts
+        uses: actions/download-artifact@v5
+        with:
+          pattern: Aseprite-${{ needs.check-version.outputs.latest_tag }}-*
+          path: release-assets
+          merge-multiple: true
+
+      # ----------------------------------------------------------
+      # Verify packages
+      # ----------------------------------------------------------
+
+      - name: Verify release assets
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          echo "Release assets:"
+          find release-assets \
+            -maxdepth 1 \
+            -type f \
+            -name '*.zip' \
+            -print
+
+          count="$(
+            find release-assets \
+              -maxdepth 1 \
+              -type f \
+              -name '*.zip' |
+            wc -l
+          )"
+
+          echo "Found $count ZIP files."
+
+          if [[ "$count" -ne 3 ]]; then
+            echo "Expected exactly 3 release packages."
+            exit 1
+          fi
+
+      # ----------------------------------------------------------
+      # Create/update one draft release
+      # ----------------------------------------------------------
+
+      - name: Create or update GitHub Release
         uses: softprops/action-gh-release@v3
         with:
+          token: ${{ github.token }}
+
           tag_name: ${{ needs.check-version.outputs.latest_tag }}
-          name: Aseprite ${{ needs.check-version.outputs.latest_tag }}
+
+          name: Release Aseprite ${{ needs.check-version.outputs.latest_tag }}
+
           draft: true
           prerelease: false
-          files: ${{ env.ASSET }}
+
+          fail_on_unmatched_files: true
+
+          files: |
+            release-assets/*.zip
