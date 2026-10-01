@@ -393,11 +393,6 @@ jobs:
 
   # ============================================================
   # Release
-  #
-  # IMPORTANT:
-  # Only ONE job touches GitHub Releases.
-  # This avoids three matrix jobs trying to modify the same
-  # release concurrently.
   # ============================================================
 
   release:
@@ -417,9 +412,13 @@ jobs:
     permissions:
       contents: write
 
+    env:
+      GH_TOKEN: ${{ github.token }}
+      TAG: ${{ needs.check-version.outputs.latest_tag }}
+
     steps:
       # ----------------------------------------------------------
-      # Download all three packages
+      # Download Windows / Linux / macOS artifacts
       # ----------------------------------------------------------
 
       - name: Download build artifacts
@@ -430,7 +429,7 @@ jobs:
           merge-multiple: true
 
       # ----------------------------------------------------------
-      # Verify packages
+      # Verify artifacts
       # ----------------------------------------------------------
 
       - name: Verify release assets
@@ -461,22 +460,67 @@ jobs:
           fi
 
       # ----------------------------------------------------------
-      # Create/update one draft release
+      # Check whether the release already exists
       # ----------------------------------------------------------
 
-      - name: Create or update GitHub Release
-        uses: softprops/action-gh-release@v3
-        with:
-          token: ${{ github.token }}
+      - name: Check existing release
+        id: release-check
+        shell: bash
+        run: |
+          set -euo pipefail
 
-          tag_name: ${{ needs.check-version.outputs.latest_tag }}
+          if gh release view "$TAG" \
+            --repo "$GITHUB_REPOSITORY" \
+            >/dev/null 2>&1; then
 
-          name: Release Aseprite ${{ needs.check-version.outputs.latest_tag }}
+            echo "Release $TAG already exists."
+            echo "exists=true" >> "$GITHUB_OUTPUT"
 
-          draft: true
-          prerelease: false
+          else
 
-          fail_on_unmatched_files: true
+            echo "Release $TAG does not exist."
+            echo "exists=false" >> "$GITHUB_OUTPUT"
 
-          files: |
-            release-assets/*.zip
+          fi
+
+      # ----------------------------------------------------------
+      # Create draft release if it doesn't exist
+      # ----------------------------------------------------------
+
+      - name: Create draft release
+        if: steps.release-check.outputs.exists != 'true'
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          gh release create "$TAG" \
+            --repo "$GITHUB_REPOSITORY" \
+            --title "Release Aseprite $TAG" \
+            --draft \
+            --target master
+
+      # ----------------------------------------------------------
+      # Upload / replace all assets
+      # ----------------------------------------------------------
+
+      - name: Upload release assets
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          gh release upload "$TAG" \
+            release-assets/*.zip \
+            --repo "$GITHUB_REPOSITORY" \
+            --clobber
+
+      # ----------------------------------------------------------
+      # Show final release
+      # ----------------------------------------------------------
+
+      - name: Show release information
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          gh release view "$TAG" \
+            --repo "$GITHUB_REPOSITORY"
